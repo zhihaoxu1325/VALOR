@@ -139,6 +139,7 @@ class MSEAccuracyEstimator:
 
     def _apply_split_construction(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
         """Apply split-construction strategy."""
+
         target_node = self._find_node_by_strategy(model, strategy)
         if not target_node:
             return model
@@ -164,6 +165,8 @@ class MSEAccuracyEstimator:
 
         self._replace_with_split_nodes(model, target_node, U, V)
 
+        U, V = self._svd_decompose_weight(weight_data, d_mid, target_node.op_type)
+        self._replace_with_low_rank_nodes(model, target_node, U, V)
         return model
     
     def _apply_mixed_strategy(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
@@ -345,6 +348,43 @@ class MSEAccuracyEstimator:
                 if init.name == original_weight_name:
                     graph.initializer.remove(init)
                     break
+
+    def _replace_with_split_nodes(self, model: onnx.ModelProto, original_node: onnx.NodeProto,
+                                  U: np.ndarray, V: np.ndarray):
+        """用两个MatMul节点替换原始节点（split construction）"""
+        graph = model.graph
+
+        U_name = self._generate_unique_name(graph, f"U_{original_node.name}")
+        V_name = self._generate_unique_name(graph, f"V_{original_node.name}")
+        Y1_name = self._generate_unique_name(graph, f"Y1_{original_node.name}")
+
+        U_init = onnx.helper.make_tensor(U_name, onnx.TensorProto.FLOAT, U.shape, U.flatten())
+        V_init = onnx.helper.make_tensor(V_name, onnx.TensorProto.FLOAT, V.shape, V.flatten())
+        graph.initializer.extend([U_init, V_init])
+
+        matmul_u = onnx.helper.make_node(
+            'MatMul',
+            inputs=[original_node.input[0], U_name],
+            outputs=[Y1_name],
+            name=f"MatMul_U_{original_node.name}"
+        )
+
+        matmul_v = onnx.helper.make_node(
+            'MatMul',
+            inputs=[Y1_name, V_name],
+            outputs=[original_node.output[0]],
+            name=f"MatMul_V_{original_node.name}"
+        )
+
+        graph.node.remove(original_node)
+        graph.node.extend([matmul_u, matmul_v])
+
+        original_weight_name = self._get_weight_name(original_node)
+        if original_weight_name:
+            for init in graph.initializer:
+                if init.name == original_weight_name:
+                    graph.initializer.remove(init)
+                    break
     
     def evaluate_mse(self, original_model: onnx.ModelProto, modified_model: onnx.ModelProto, 
                     test_data: List[np.ndarray]) -> float:
@@ -393,6 +433,7 @@ class MSEAccuracyEstimator:
     def predict_accuracy_loss(self, strategies: List[OptimizationStrategy],
                               layer_infos: List[LayerInfo]) -> float:
         """FAP: Predict accuracy loss for strategy combinations."""
+
         if not strategies:
             return 0.0
 

@@ -148,7 +148,9 @@ class OptimizationStrategy:
         return None
     
     def get_low_rank_info(self) -> Optional[Dict[str, Any]]:
+      
         """Get low-rank decomposition info."""
+
         if self.strategy_type in [StrategyType.LOW_RANK, StrategyType.SPLIT_CONSTRUCTION, StrategyType.MIXED]:
             return {
                 "rank": self.parameters.get("rank", self.parameters.get("d_mid", None)),
