@@ -55,6 +55,8 @@ class MSEAccuracyEstimator:
             return self._apply_activation_quantization(model, strategy)
         elif strategy.strategy_type == StrategyType.LOW_RANK:
             return self._apply_low_rank_decomposition(model, strategy)
+        elif strategy.strategy_type == StrategyType.SPLIT_CONSTRUCTION:
+            return self._apply_split_construction(model, strategy)
         elif strategy.strategy_type == StrategyType.MIXED:
             return self._apply_mixed_strategy(model, strategy)
         else:
@@ -133,6 +135,35 @@ class MSEAccuracyEstimator:
         # 替换原始节点为两个矩阵乘法节点
         self._replace_with_low_rank_nodes(model, target_node, U, V)
         
+        return model
+
+    def _apply_split_construction(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
+        """应用split construction策略"""
+        target_node = self._find_node_by_strategy(model, strategy)
+        if not target_node:
+            return model
+
+        if target_node.op_type not in ["MatMul", "Gemm"]:
+            return model
+
+        weight_name = self._get_weight_name(target_node)
+        if not weight_name:
+            return model
+
+        weight_data = self._get_weight_data(model, weight_name)
+        if weight_data is None:
+            return model
+
+        d_mid = strategy.parameters.get("d_mid")
+        if not d_mid or d_mid <= 0:
+            return model
+
+        U, V = self._build_split_weights(weight_data, d_mid)
+        if U is None or V is None:
+            return model
+
+        self._replace_with_split_nodes(model, target_node, U, V)
+
         return model
     
     def _apply_mixed_strategy(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
@@ -277,6 +308,43 @@ class MSEAccuracyEstimator:
                 if init.name == original_weight_name:
                     graph.initializer.remove(init)
                     break
+
+    def _replace_with_split_nodes(self, model: onnx.ModelProto, original_node: onnx.NodeProto,
+                                  U: np.ndarray, V: np.ndarray):
+        """用两个MatMul节点替换原始节点（split construction）"""
+        graph = model.graph
+
+        U_name = self._generate_unique_name(graph, f"U_{original_node.name}")
+        V_name = self._generate_unique_name(graph, f"V_{original_node.name}")
+        Y1_name = self._generate_unique_name(graph, f"Y1_{original_node.name}")
+
+        U_init = onnx.helper.make_tensor(U_name, onnx.TensorProto.FLOAT, U.shape, U.flatten())
+        V_init = onnx.helper.make_tensor(V_name, onnx.TensorProto.FLOAT, V.shape, V.flatten())
+        graph.initializer.extend([U_init, V_init])
+
+        matmul_u = onnx.helper.make_node(
+            'MatMul',
+            inputs=[original_node.input[0], U_name],
+            outputs=[Y1_name],
+            name=f"MatMul_U_{original_node.name}"
+        )
+
+        matmul_v = onnx.helper.make_node(
+            'MatMul',
+            inputs=[Y1_name, V_name],
+            outputs=[original_node.output[0]],
+            name=f"MatMul_V_{original_node.name}"
+        )
+
+        graph.node.remove(original_node)
+        graph.node.extend([matmul_u, matmul_v])
+
+        original_weight_name = self._get_weight_name(original_node)
+        if original_weight_name:
+            for init in graph.initializer:
+                if init.name == original_weight_name:
+                    graph.initializer.remove(init)
+                    break
     
     def evaluate_mse(self, original_model: onnx.ModelProto, modified_model: onnx.ModelProto, 
                     test_data: List[np.ndarray]) -> float:
@@ -321,6 +389,55 @@ class MSEAccuracyEstimator:
         except Exception as e:
             print(f"Error in MSE evaluation: {e}")
             return float('inf')
+
+    def predict_accuracy_loss(self, strategies: List[OptimizationStrategy],
+                              layer_infos: List[LayerInfo]) -> float:
+        """FAP: 预测策略组合的精度损失"""
+        if not strategies:
+            return 0.0
+
+        layer_order = {layer.name: idx for idx, layer in enumerate(layer_infos)}
+        ordered = sorted(
+            [s for s in strategies if s.strategy_type != StrategyType.ORIGINAL],
+            key=lambda s: layer_order.get(s.layer_name, float('inf'))
+        )
+
+        layer_errors = {}
+        layer_vectors = {}
+
+        for strategy in ordered:
+            node = self._find_node_by_strategy(self.original_model, strategy)
+            if not node:
+                continue
+            weight_name = self._get_weight_name(node)
+            if not weight_name:
+                continue
+            weight_data = self._get_weight_data(self.original_model, weight_name)
+            if weight_data is None:
+                continue
+
+            layer_vectors[strategy.layer_name] = weight_data.flatten()
+            layer_errors[strategy.layer_name] = self._estimate_strategy_error(
+                strategy, weight_data
+            )
+
+        total_loss = 0.0
+        for strategy in ordered:
+            layer_name = strategy.layer_name
+            if layer_name not in layer_errors:
+                continue
+
+            alpha = 1.0
+            for prev in ordered:
+                if layer_order.get(prev.layer_name, float('inf')) >= layer_order.get(layer_name, float('inf')):
+                    break
+                prev_error = layer_errors.get(prev.layer_name, 0.0)
+                kappa = self._estimate_coupling(prev.layer_name, layer_name, layer_vectors)
+                alpha += prev_error * kappa
+
+            total_loss += alpha * layer_errors[layer_name]
+
+        return total_loss
     
     def measure_latency(self, model_path: str, test_data: List[np.ndarray]) -> float:
         """测量模型推理延迟"""
@@ -420,6 +537,74 @@ class MSEAccuracyEstimator:
                 weight_data = onnx.numpy_helper.to_array(init)
                 quantized_weight = self._symmetric_quantize(weight_data, bits, per_channel=False)
                 self._update_weight_in_model(model, init.name, quantized_weight)
+
+    def _build_split_weights(self, weight: np.ndarray, d_mid: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """构造split construction权重"""
+        if weight.ndim != 2:
+            return None, None
+
+        k_dim, m_dim = weight.shape
+        if d_mid >= k_dim:
+            u = np.zeros((k_dim, d_mid), dtype=np.float32)
+            u[:, :k_dim] = np.eye(k_dim, dtype=np.float32)
+            v = np.zeros((d_mid, m_dim), dtype=np.float32)
+            v[:k_dim, :] = weight.astype(np.float32)
+            return u, v
+
+        u_svd, v_svd = self._svd_decompose_weight(weight, d_mid, "MatMul")
+        return u_svd, v_svd
+
+    def _estimate_strategy_error(self, strategy: OptimizationStrategy, weight: np.ndarray) -> float:
+        """估算单策略重构误差"""
+        if weight.ndim < 2:
+            return 0.0
+
+        weight_norm = np.linalg.norm(weight) + 1e-8
+
+        if strategy.strategy_type == StrategyType.WEIGHT_QUANTIZATION:
+            bits = strategy.parameters.get("bits", 8)
+            quantized = self._symmetric_quantize(weight, bits, per_channel=False)
+            return float(np.linalg.norm(weight - quantized) ** 2 / (weight_norm ** 2))
+
+        if strategy.strategy_type == StrategyType.ACTIVATION_QUANTIZATION:
+            return 0.01
+
+        if strategy.strategy_type == StrategyType.LOW_RANK:
+            rank = strategy.parameters.get("rank", min(weight.shape))
+            u, v = self._svd_decompose_weight(weight, rank, "MatMul")
+            recon = u @ v
+            return float(np.linalg.norm(weight - recon) ** 2 / (weight_norm ** 2))
+
+        if strategy.strategy_type == StrategyType.SPLIT_CONSTRUCTION:
+            d_mid = strategy.parameters.get("d_mid", min(weight.shape))
+            u, v = self._build_split_weights(weight, d_mid)
+            if u is None or v is None:
+                return 0.0
+            recon = u @ v
+            return float(np.linalg.norm(weight - recon) ** 2 / (weight_norm ** 2))
+
+        if strategy.strategy_type == StrategyType.MIXED:
+            rank = strategy.parameters.get("rank", min(weight.shape))
+            bits = strategy.parameters.get("quantization_bits", 8)
+            u, v = self._svd_decompose_weight(weight, rank, "MatMul")
+            recon = u @ v
+            quantized = self._symmetric_quantize(recon, bits, per_channel=False)
+            return float(np.linalg.norm(weight - quantized) ** 2 / (weight_norm ** 2))
+
+        return 0.0
+
+    def _estimate_coupling(self, layer_a: str, layer_b: str,
+                           layer_vectors: Dict[str, np.ndarray]) -> float:
+        """估算层间耦合系数"""
+        vec_a = layer_vectors.get(layer_a)
+        vec_b = layer_vectors.get(layer_b)
+        if vec_a is None or vec_b is None:
+            return 0.0
+        norm_a = np.linalg.norm(vec_a)
+        norm_b = np.linalg.norm(vec_b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(abs(np.dot(vec_a, vec_b)) / (norm_a * norm_b))
 
 
 if __name__ == "__main__":

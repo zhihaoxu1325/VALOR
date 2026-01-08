@@ -3,6 +3,7 @@
 基于RVV长度和层信息生成优化策略候选，包括量化策略和低秩分解策略
 """
 
+import math
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Any
 from enum import Enum
@@ -18,6 +19,7 @@ class StrategyType(Enum):
     WEIGHT_QUANTIZATION = "weight_quantization"
     ACTIVATION_QUANTIZATION = "activation_quantization"
     LOW_RANK = "low_rank"
+    SPLIT_CONSTRUCTION = "split_construction"
     MIXED = "mixed"
 
 
@@ -69,12 +71,15 @@ class RVVAwareStrategyGenerator:
         
         # 3. 生成量化策略
         strategies.extend(self._generate_quantization_strategies(layer_info))
-        
-        # 4. 生成低秩分解策略（仅适用于某些层类型）
+
+        # 4. 生成split construction策略（clogging节点）
+        strategies.extend(self._generate_split_strategies(layer_info))
+
+        # 5. 生成低秩分解策略（仅适用于某些层类型）
         if self._supports_low_rank(layer_info):
             strategies.extend(self._generate_low_rank_strategies(layer_info))
-        
-        # 5. 生成混合策略（低秩+量化）
+
+        # 6. 生成混合策略（低秩+量化）
         if self._supports_low_rank(layer_info):
             strategies.extend(self._generate_mixed_strategies(layer_info))
         
@@ -113,6 +118,44 @@ class RVVAwareStrategyGenerator:
                     expected_speedup=self._estimate_quantization_speedup(bits, is_activation=True)
                 ))
         
+        return strategies
+
+    def _generate_split_strategies(self, layer_info: LayerInfo) -> List[OptimizationStrategy]:
+        """生成split construction策略"""
+        if layer_info.op_type not in ["MatMul", "Gemm"]:
+            return []
+        if not layer_info.weight_shape or len(layer_info.weight_shape) < 2:
+            return []
+
+        K, M = self._get_matrix_dimensions(layer_info.weight_shape, layer_info.op_type)
+        eta = self.w
+
+        if eta <= 0 or K % eta == 0:
+            return []
+
+        max_d_mid = self._calculate_d_mid_upper_bound(K, M, eta)
+        max_d_mid = min(max_d_mid, K, M)
+        if max_d_mid < eta:
+            return []
+
+        candidates = []
+        for d_mid in range(eta, max_d_mid + 1, eta):
+            if self._calculate_clogging_level(K, M, d_mid, eta) < 0:
+                candidates.append(d_mid)
+
+        strategies = []
+        for d_mid in candidates:
+            strategies.append(OptimizationStrategy(
+                layer_name=layer_info.name,
+                strategy_type=StrategyType.SPLIT_CONSTRUCTION,
+                parameters={
+                    "d_mid": d_mid,
+                    "eta": eta
+                },
+                target="weight",
+                expected_speedup=self._estimate_split_speedup(K, M, d_mid, eta)
+            ))
+
         return strategies
     
     def _generate_low_rank_strategies(self, layer_info: LayerInfo) -> List[OptimizationStrategy]:
@@ -202,6 +245,42 @@ class RVVAwareStrategyGenerator:
             K, M = weight_shape[-1], weight_shape[0]
         
         return K, M
+
+    def _calculate_d_mid_upper_bound(self, K: int, M: int, eta: int) -> int:
+        """计算满足CL<0的d_mid上界"""
+        if eta <= 0:
+            return 0
+
+        k_tiles = math.ceil(K / eta)
+        denom = k_tiles + (M / eta)
+        if denom <= 0:
+            return 0
+
+        upper = (M * k_tiles) / denom
+        upper_int = max(0, math.floor(upper - 1e-9))
+        return (upper_int // eta) * eta
+
+    def _calculate_clogging_level(self, K: int, M: int, d_mid: int, eta: int) -> float:
+        """计算clogging level (I(G') - I(G))"""
+        original = self._instruction_count(K, M, eta)
+        split = self._split_instruction_count(K, M, d_mid, eta)
+        return split - original
+
+    def _instruction_count(self, K: int, M: int, eta: int) -> int:
+        """估算指令数（基于tail近似模型）"""
+        return M * math.ceil(K / eta)
+
+    def _split_instruction_count(self, K: int, M: int, d_mid: int, eta: int) -> int:
+        """估算split后的指令数（两段矩阵乘）"""
+        return (d_mid * math.ceil(K / eta)) + (M * math.ceil(d_mid / eta))
+
+    def _estimate_split_speedup(self, K: int, M: int, d_mid: int, eta: int) -> float:
+        """估算split策略的加速比"""
+        original = self._instruction_count(K, M, eta)
+        split = self._split_instruction_count(K, M, d_mid, eta)
+        if split <= 0:
+            return 1.0
+        return min(original / split, 5.0)
     
     def _calculate_valid_ranks(self, weight_shape: Tuple[int, ...], op_type: str) -> List[int]:
         """计算有效的rank值"""
@@ -284,7 +363,8 @@ class RVVAwareStrategyGenerator:
             StrategyType.ORIGINAL: 0.0,
             StrategyType.WEIGHT_QUANTIZATION: 0.3,
             StrategyType.ACTIVATION_QUANTIZATION: 0.4,
-            StrategyType.LOW_RANK: 0.5,
+            StrategyType.SPLIT_CONSTRUCTION: 0.5,
+            StrategyType.LOW_RANK: 0.6,
             StrategyType.MIXED: 0.8
         }
         
@@ -296,7 +376,7 @@ class RVVAwareStrategyGenerator:
             if strategy.strategy_type == StrategyType.WEIGHT_QUANTIZATION:
                 bits = strategy.parameters.get("bits", 8)
                 risk = base_risk * (8 / bits)
-            elif strategy.strategy_type == StrategyType.LOW_RANK:
+            elif strategy.strategy_type in [StrategyType.LOW_RANK, StrategyType.SPLIT_CONSTRUCTION]:
                 # rank越小风险越大（这里需要更复杂的计算，暂时简化）
                 risk = base_risk
             else:
