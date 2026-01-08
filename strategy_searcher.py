@@ -422,8 +422,9 @@ class GreedyStrategySearcher:
             StrategyType.ORIGINAL: 0,
             StrategyType.WEIGHT_QUANTIZATION: 1,
             StrategyType.ACTIVATION_QUANTIZATION: 2,
-            StrategyType.LOW_RANK: 3,
-            StrategyType.MIXED: 4
+            StrategyType.SPLIT_CONSTRUCTION: 3,
+            StrategyType.LOW_RANK: 4,
+            StrategyType.MIXED: 5
         }
         
         current_aggressiveness = aggressiveness_order.get(current_strategy.strategy_type, 0)
@@ -459,6 +460,11 @@ class GreedyStrategySearcher:
         elif current.strategy_type == StrategyType.LOW_RANK:
             current_rank = current.parameters.get("rank", float('inf'))
             candidate_rank = candidate.parameters.get("rank", float('inf'))
+            return candidate_rank < current_rank
+
+        elif current.strategy_type == StrategyType.SPLIT_CONSTRUCTION:
+            current_rank = current.parameters.get("d_mid", float('inf'))
+            candidate_rank = candidate.parameters.get("d_mid", float('inf'))
             return candidate_rank < current_rank
         
         elif current.strategy_type == StrategyType.MIXED:

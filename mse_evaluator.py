@@ -55,6 +55,8 @@ class MSEAccuracyEstimator:
             return self._apply_activation_quantization(model, strategy)
         elif strategy.strategy_type == StrategyType.LOW_RANK:
             return self._apply_low_rank_decomposition(model, strategy)
+        elif strategy.strategy_type == StrategyType.SPLIT_CONSTRUCTION:
+            return self._apply_split_construction(model, strategy)
         elif strategy.strategy_type == StrategyType.MIXED:
             return self._apply_mixed_strategy(model, strategy)
         else:
@@ -133,6 +135,32 @@ class MSEAccuracyEstimator:
         # 替换原始节点为两个矩阵乘法节点
         self._replace_with_low_rank_nodes(model, target_node, U, V)
         
+        return model
+
+    def _apply_split_construction(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
+        """应用split construction策略"""
+        target_node = self._find_node_by_strategy(model, strategy)
+        if not target_node:
+            return model
+
+        if target_node.op_type not in ["MatMul", "Gemm"]:
+            return model
+
+        weight_name = self._get_weight_name(target_node)
+        if not weight_name:
+            return model
+
+        weight_data = self._get_weight_data(model, weight_name)
+        if weight_data is None:
+            return model
+
+        d_mid = strategy.parameters.get("d_mid")
+        if not d_mid or d_mid <= 0:
+            return model
+
+        U, V = self._svd_decompose_weight(weight_data, d_mid, target_node.op_type)
+        self._replace_with_low_rank_nodes(model, target_node, U, V)
+
         return model
     
     def _apply_mixed_strategy(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
