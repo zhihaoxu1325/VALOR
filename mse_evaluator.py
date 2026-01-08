@@ -164,6 +164,9 @@ class MSEAccuracyEstimator:
 
         self._replace_with_split_nodes(model, target_node, U, V)
 
+        U, V = self._svd_decompose_weight(weight_data, d_mid, target_node.op_type)
+        self._replace_with_low_rank_nodes(model, target_node, U, V)
+
         return model
     
     def _apply_mixed_strategy(self, model: onnx.ModelProto, strategy: OptimizationStrategy) -> onnx.ModelProto:
