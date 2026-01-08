@@ -242,6 +242,10 @@ class GreedyStrategySearcher:
                 chosen_idx = trial.suggest_categorical(f"strategy_{layer.name}", 
                                                      list(range(len(available_strategies))))
                 selected_strategies.append(available_strategies[chosen_idx])
+
+            predicted_loss = self.evaluator.predict_accuracy_loss(selected_strategies, layer_infos)
+            if predicted_loss > self.config.accuracy_threshold * self.early_stop_multiplier:
+                raise optuna.TrialPruned()
             
             # 获取本次trial的样本数预算
             n_samples = trial.suggest_categorical("n_samples", self.sample_progression)
@@ -249,8 +253,7 @@ class GreedyStrategySearcher:
             
             # Early stopping: 快速精度检查
             if n_samples == self.min_samples:
-                quick_mse = self._evaluate_strategies_mse(selected_strategies, current_test_data)
-                if quick_mse > self.config.accuracy_threshold * self.early_stop_multiplier:
+                if predicted_loss > self.config.accuracy_threshold * self.early_stop_multiplier:
                     raise optuna.TrialPruned()
             
             # 完整评估
@@ -422,8 +425,9 @@ class GreedyStrategySearcher:
             StrategyType.ORIGINAL: 0,
             StrategyType.WEIGHT_QUANTIZATION: 1,
             StrategyType.ACTIVATION_QUANTIZATION: 2,
-            StrategyType.LOW_RANK: 3,
-            StrategyType.MIXED: 4
+            StrategyType.SPLIT_CONSTRUCTION: 3,
+            StrategyType.LOW_RANK: 4,
+            StrategyType.MIXED: 5
         }
         
         current_aggressiveness = aggressiveness_order.get(current_strategy.strategy_type, 0)
@@ -459,6 +463,11 @@ class GreedyStrategySearcher:
         elif current.strategy_type == StrategyType.LOW_RANK:
             current_rank = current.parameters.get("rank", float('inf'))
             candidate_rank = candidate.parameters.get("rank", float('inf'))
+            return candidate_rank < current_rank
+
+        elif current.strategy_type == StrategyType.SPLIT_CONSTRUCTION:
+            current_rank = current.parameters.get("d_mid", float('inf'))
+            candidate_rank = candidate.parameters.get("d_mid", float('inf'))
             return candidate_rank < current_rank
         
         elif current.strategy_type == StrategyType.MIXED:

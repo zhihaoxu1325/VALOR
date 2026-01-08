@@ -21,6 +21,7 @@ class StrategyType(Enum):
     WEIGHT_QUANTIZATION = "weight_quantization"
     ACTIVATION_QUANTIZATION = "activation_quantization"
     LOW_RANK = "low_rank"
+    SPLIT_CONSTRUCTION = "split_construction"
     MIXED = "mixed"
 
 
@@ -148,9 +149,9 @@ class OptimizationStrategy:
     
     def get_low_rank_info(self) -> Optional[Dict[str, Any]]:
         """获取低秋分解相关信息"""
-        if self.strategy_type in [StrategyType.LOW_RANK, StrategyType.MIXED]:
+        if self.strategy_type in [StrategyType.LOW_RANK, StrategyType.SPLIT_CONSTRUCTION, StrategyType.MIXED]:
             return {
-                "rank": self.parameters.get("rank", None),
+                "rank": self.parameters.get("rank", self.parameters.get("d_mid", None)),
                 "decomposition_method": self.parameters.get("decomposition_method", "svd")
             }
         return None
@@ -178,6 +179,14 @@ class OptimizationStrategy:
                 return 1.0
             
             return original_size / compressed_size
+
+        elif self.strategy_type == StrategyType.SPLIT_CONSTRUCTION:
+            rank = self.parameters.get("d_mid", min(original_weight_shape))
+            if len(original_weight_shape) == 2:  # FC layer
+                m, k = original_weight_shape
+                compressed_size = (k * rank) + (rank * m)
+                return original_size / compressed_size
+            return 1.0
         
         elif self.strategy_type == StrategyType.MIXED:
             # 综合考虑低秋和量化的压缩比
